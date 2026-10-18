@@ -1,0 +1,140 @@
+# Smoke test of the released Bellbriar harness 1.0.0, as a site's
+# repository and a new user meet it (PREPUBLISH item 17): the Action
+# (bellbriar/eval-action@v1) on x86-64 and ARM64, its gate failing a page
+# that fails, its sandbox mode, and each install line of the README on a
+# clean machine (pipx, uv, the container image, and the lint line of
+# examples/ci/bellbriar-eval.yml). Delete this repository once it passes.
+name: smoke test
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  action:
+    name: The Action passes a clean page (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - uses: bellbriar/eval-action@v1
+        with:
+          args: site --render --fail-on tier1 --json bellbriar-report.json --html bellbriar-report.html
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-${{ matrix.runner }}
+          path: bellbriar-report.*
+
+  gate:
+    name: The Action fails a failing page
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: A page whose image has no text alternative
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><img src="photo.png"></main></body>' \
+            '</html>' > site/index.html
+      - id: eval
+        uses: bellbriar/eval-action@v1
+        continue-on-error: true
+        with:
+          args: site --fail-on tier1
+      - name: The gate failed, as it should
+        env:
+          OUTCOME: ${{ steps.eval.outcome }}
+        run: test "$OUTCOME" = failure
+
+  sandbox:
+    name: The Action with its sandbox required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - uses: bellbriar/eval-action@v1
+        with:
+          sandbox: required
+          args: site --render --fail-on tier1
+
+  pipx:
+    name: pipx install, as README says (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - run: pipx install 'bellbriar-harness[browser]'
+      - run: bellbriar-eval --install-browser
+      - run: bellbriar-eval --version
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - run: bellbriar-eval site --render --fail-on tier1
+
+  uv:
+    name: uv tool install, as README says
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - run: pipx install uv
+      - run: uv tool install 'bellbriar-harness[browser]'
+      - run: bellbriar-eval --version
+      - run: bellbriar-evidence --help
+
+  container:
+    name: The container image, as README runs it
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p dist
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > dist/index.html
+      - run: |
+          docker run --rm --init --shm-size=2g --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work" ghcr.io/bellbriar/harness:1 dist --render --html report.html
+      - run: test -s report.html
+
+  lint:
+    name: bellbriar-lint, as the CI template runs it
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: A component with nothing to flag
+        run: |
+          mkdir -p src
+          printf '%s\n' 'export default function App() {' \
+            '  return <main><h1>Smoke test</h1><img src="logo.png" alt="Bellbriar" /></main>;' \
+            '}' > src/App.jsx
+      - run: pipx run --spec "bellbriar-harness==1.*" bellbriar-lint src/ --fail-on error
