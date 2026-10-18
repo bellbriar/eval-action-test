@@ -1,0 +1,221 @@
+# Smoke test of the released Bellbriar harness 1.0.0 on Ubuntu 26.04, to
+# which GitHub moves the ubuntu-latest label between October 19 and
+# November 19, 2026: smoke.yml's checks (PREPUBLISH item 17), on
+# ubuntu-26.04 and ubuntu-26.04-arm, plus Playwright's install-deps, which
+# README names and the harness's own CI runs. Each job writes what it found
+# as notices (the run's annotations), and the gate must fail on the missing
+# text alternative alone. Delete this repository once it passes.
+name: smoke test, Ubuntu 26.04
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A notice of what a JSON report records: the harness, Python,
+  # Playwright and Chromium that ran, the sandbox, failures and layers.
+  REPORT_NOTICE: |
+    import json, sys
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    t = d["tool"]
+    pages = d.get("pages") or [{}]
+    b = (pages[0].get("fetch") or {}).get("browser") or {}
+    layers = " ".join(f'{x["layer"]}={x["status"]}' for x in d["layers"])
+    print(f'::notice title=report::harness {t["version"]}, Python {t["python"]}, '
+          f'Playwright {t["libraries"].get("playwright")}, '
+          f'Chromium {b.get("version")}, sandbox {b.get("sandbox")}, '
+          f'fails {d["site"]["rule_fail_totals"]}, errors {d["errors"]}, {layers}')
+  # A notice of the runner: system, architecture, Python, pipx, Docker,
+  # and the AppArmor switch that Chromium's sandbox needs off.
+  RUNNER_NOTICE: |
+    . /etc/os-release
+    userns=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)
+    echo "::notice title=runner::$PRETTY_NAME, $(uname -m), $(python3 --version 2>&1), pipx $(pipx --version 2>/dev/null || echo absent), $(docker --version 2>/dev/null || echo docker absent), kernel.apparmor_restrict_unprivileged_userns=$userns"
+
+jobs:
+  action:
+    name: The Action passes a clean page (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - uses: bellbriar/eval-action@v1
+        with:
+          args: site --render --fail-on tier1 --json bellbriar-report.json --html bellbriar-report.html
+      - name: What the report records
+        if: always()
+        run: python3 -c "$REPORT_NOTICE" bellbriar-report.json
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-${{ matrix.runner }}
+          path: bellbriar-report.*
+
+  gate:
+    name: The Action fails a failing page, on its missing text alternative
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - name: A page whose image has no text alternative
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><img src="photo.png"></main></body>' \
+            '</html>' > site/index.html
+      - id: eval
+        uses: bellbriar/eval-action@v1
+        continue-on-error: true
+        with:
+          args: site --fail-on tier1 --json gate.json
+      - name: The gate failed, on that image alone
+        env:
+          OUTCOME: ${{ steps.eval.outcome }}
+        run: |
+          python3 -c "$REPORT_NOTICE" gate.json
+          test "$OUTCOME" = failure
+          python3 -c 'import json; d = json.load(open("gate.json")); raise SystemExit(d["site"]["rule_fail_totals"] != {"bb-img-alt": 1} or d["errors"] != 0)'
+
+  sandbox:
+    name: The Action with its sandbox required (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - id: sysctl
+        name: The Action README's line for Ubuntu 24.04
+        continue-on-error: true
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Say so if that line failed
+        if: steps.sysctl.outcome == 'failure'
+        run: echo "::warning title=sysctl::the Action README's sysctl line failed on this runner"
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - uses: bellbriar/eval-action@v1
+        with:
+          sandbox: required
+          args: site --render --fail-on tier1 --json r.json
+      - name: What the report records
+        if: always()
+        run: python3 -c "$REPORT_NOTICE" r.json
+
+  pipx:
+    name: pipx install, as README says (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - run: pipx install 'bellbriar-harness[browser]'
+      - id: browser
+        continue-on-error: true
+        run: bellbriar-eval --install-browser
+      - name: Chromium's system libraries, as README says, had it not started
+        if: steps.browser.outcome == 'failure'
+        run: |
+          echo "::warning title=install-browser::bellbriar-eval --install-browser failed; installing Playwright's system libraries, as README says"
+          sudo "$(pipx environment --value PIPX_LOCAL_VENVS)/bellbriar-harness/bin/python" -m playwright install-deps chromium
+          bellbriar-eval --install-browser
+      - run: bellbriar-eval --version
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p site
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > site/index.html
+      - run: bellbriar-eval site --render --fail-on tier1 --json r.json
+      - name: What the report records
+        if: always()
+        run: python3 -c "$REPORT_NOTICE" r.json
+      - id: deps
+        name: Playwright's install-deps, which README names and the harness's CI runs
+        continue-on-error: true
+        run: sudo "$(pipx environment --value PIPX_LOCAL_VENVS)/bellbriar-harness/bin/python" -m playwright install-deps chromium
+      - name: Say so if it failed
+        if: steps.deps.outcome == 'failure'
+        run: echo "::warning title=install-deps::Playwright's install-deps chromium failed on this runner"
+
+  uv:
+    name: uv tool install, as README says
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - run: pipx install uv
+      - run: uv tool install 'bellbriar-harness[browser]'
+      - name: The version, and the Python uv chose
+        run: echo "::notice title=uv::$(bellbriar-eval --version), $("$(uv tool dir)/bellbriar-harness/bin/python" --version)"
+      - run: bellbriar-evidence --help
+
+  container:
+    name: The container image, as README runs it (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - name: A page with nothing to fail
+        run: |
+          mkdir -p dist
+          printf '%s\n' '<!doctype html>' '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>Smoke test</title></head>' \
+            '<body><main><h1>Smoke test</h1><p>Nothing here should fail.</p></main></body>' \
+            '</html>' > dist/index.html
+      - run: |
+          docker run --rm --init --shm-size=2g --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work" ghcr.io/bellbriar/harness:1 dist --render --html report.html --json report.json
+      - run: test -s report.html
+      - name: What the report records
+        if: always()
+        run: python3 -c "$REPORT_NOTICE" report.json
+
+  lint:
+    name: bellbriar-lint, as the CI template runs it
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: The runner
+        run: bash -c "$RUNNER_NOTICE"
+      - name: A component with nothing to flag
+        run: |
+          mkdir -p src
+          printf '%s\n' 'export default function App() {' \
+            '  return <main><h1>Smoke test</h1><img src="logo.png" alt="Bellbriar" /></main>;' \
+            '}' > src/App.jsx
+      - run: pipx run --spec "bellbriar-harness==1.*" bellbriar-lint src/ --fail-on error
